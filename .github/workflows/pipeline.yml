@@ -1,0 +1,179 @@
+name: CI/CD
+
+# CI/CD for the MCP gateway. Two jobs:
+#   validate  every push and PR: compose config, yamllint, catalog checks, LF,
+#             shellcheck of the deploy script. No image is built or pushed: the
+#             gateway runs the upstream docker/mcp-gateway image.
+#   deploy    push to main that changed docker-compose-denis.yaml,
+#             mcp_catalog.yaml or mcp_config.yaml, or Run workflow on main;
+#             owner only: SSH to Dennis with a forced-command key that can only
+#             run /opt/deploy/mcp_gateway.sh <sha> (deploy/dennis-deploy.sh):
+#             checkout → compose pull + up -d → wait for the healthcheck
+#             (CLAUDE.md § CD to Dennis).
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      deploy: ${{ steps.changes.outputs.deploy }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0 # full history for the deploy diff below
+
+      # The real secret is gitignored; compose only needs a file at the path.
+      - name: Dummy secret file
+        run: cp mcp_secret.example.env mcp_secret.env
+
+      - name: Compose config (local)
+        run: docker compose -f docker-compose.yaml config -q
+
+      - name: Compose config (Dennis)
+        run: docker compose -f docker-compose-denis.yaml config -q
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install checkers
+        run: pip install "yamllint==1.35.1" "PyYAML==6.0.2"
+
+      # mcp_catalog.yaml is the upstream Docker catalog (long lines, upstream
+      # style), so lint for structure, not style.
+      - name: yamllint
+        run: >-
+          yamllint --strict -d
+          "{extends: relaxed, rules: {line-length: disable, trailing-spaces: disable, indentation: disable, empty-lines: disable}}"
+          mcp_catalog.yaml mcp_config.yaml docker-compose.yaml docker-compose-denis.yaml .github/workflows/pipeline.yml
+
+      - name: Catalog and compose consistency
+        run: python ci/check_config.py
+
+      - name: LF line endings
+        run: |
+          if git ls-files -z | xargs -0 grep -lI $'\r' ; then
+            echo "CRLF line endings in the files above"; exit 1
+          fi
+
+      # shellcheck is preinstalled on GitHub's Ubuntu runners.
+      - name: shellcheck the deploy script
+        run: shellcheck deploy/dennis-deploy.sh
+
+      # Deploy when a deployed file changed on main (git diff of the push
+      # range), or on Run workflow from main. Same step in sandbox.
+      - name: Deploy? (a deployed file changed on main)
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DEPLOY_PATHS: docker-compose-denis.yaml mcp_catalog.yaml mcp_config.yaml
+        run: |
+          read -ra paths <<<"$DEPLOY_PATHS"
+          deploy=false
+          if [ "$REF" = refs/heads/main ]; then
+            if [ "$EVENT" = workflow_dispatch ]; then
+              deploy=true
+            elif [ "$EVENT" = push ]; then
+              if [ -z "$PUSH_BEFORE" ] || ! git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                deploy=true # no usable base: can't tell, so don't skip a deploy
+              elif ! git diff --quiet "$PUSH_BEFORE" "$GITHUB_SHA" -- "${paths[@]}"; then
+                deploy=true
+              fi
+            fi
+          fi
+          echo "deploy=$deploy" | tee -a "$GITHUB_OUTPUT"
+
+  # CD — deploys this commit to Dennis over SSH; builds nothing. The key in
+  # DENNIS_SSH_KEY is pinned on Dennis to a forced command, so all it can do is
+  # run /opt/deploy/mcp_gateway.sh with this sha (deploy/dennis-deploy.sh).
+  # Same job in sandbox and mcp_gateway; runbook: CLAUDE.md § CD to Dennis.
+  deploy:
+    name: deploy
+    needs: [validate]
+    # Only this repo (never a fork) and only the owner; pull requests never get
+    # here (`deploy` is true only for push / Run workflow on main).
+    if: >-
+      needs.validate.outputs.deploy == 'true'
+      && github.repository == 'konstantinosmpouros/mcp_gateway'
+      && github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: deploy-dennis
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      # Fail closed: only the repository owner can ship to production (also
+      # covers a re-run started by someone else).
+      - name: Only the repository owner can deploy
+        env:
+          ACTOR: ${{ github.triggering_actor }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          if [ "$ACTOR" != "$OWNER" ]; then
+            echo "::error::Deploys are started by $OWNER only (this run was started by $ACTOR)."
+            exit 1
+          fi
+
+      # The key and the pinned host key go to $RUNNER_TEMP with umask 077;
+      # nothing here is echoed (no set -x).
+      - name: Write the SSH key and the pinned host key
+        env:
+          SSH_HOST: ${{ secrets.DENNIS_SSH_HOST }}
+          SSH_USER: ${{ secrets.DENNIS_SSH_USER }}
+          SSH_KEY: ${{ secrets.DENNIS_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DENNIS_SSH_KNOWN_HOSTS }}
+        run: |
+          missing=""
+          [ -n "$SSH_HOST" ] || missing="$missing DENNIS_SSH_HOST"
+          [ -n "$SSH_USER" ] || missing="$missing DENNIS_SSH_USER"
+          [ -n "$SSH_KEY" ] || missing="$missing DENNIS_SSH_KEY"
+          [ -n "$SSH_KNOWN_HOSTS" ] || missing="$missing DENNIS_SSH_KNOWN_HOSTS"
+          if [ -n "$missing" ]; then
+            echo "::error::Repository secret(s) not set:$missing (Settings → Secrets and variables → Actions → Repository secrets)."
+            exit 1
+          fi
+          umask 077
+          dir="$RUNNER_TEMP/dennis-ssh"
+          mkdir -p "$dir"
+          printf '%s\n' "$SSH_KEY" > "$dir/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$dir/known_hosts"
+
+      # The forced command ignores everything but $SSH_ORIGINAL_COMMAND (the
+      # sha) and prints one line per step; its exit code is this step's.
+      - name: Deploy over SSH
+        env:
+          SSH_HOST: ${{ secrets.DENNIS_SSH_HOST }}
+          SSH_USER: ${{ secrets.DENNIS_SSH_USER }}
+        run: |
+          dir="$RUNNER_TEMP/dennis-ssh"
+          ssh -T \
+            -i "$dir/id_ed25519" \
+            -o IdentitiesOnly=yes \
+            -o UserKnownHostsFile="$dir/known_hosts" \
+            -o GlobalKnownHostsFile=/dev/null \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 \
+            "$SSH_USER@$SSH_HOST" "$GITHUB_SHA"
+
+      - name: Remove the SSH key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/dennis-ssh"

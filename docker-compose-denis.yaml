@@ -1,0 +1,53 @@
+# Dennis. Plain Compose, not a Swarm stack: Swarm ignores privileged, so
+# dind's inner dockerd never starts there. Fixed project name, so it doesn't
+# follow the folder. Deployed by CD from the repo clone in /opt/mcp_gateway/repo
+# (deploy/dennis-deploy.sh); runbook: CLAUDE.md § CD to Dennis.
+name: mcp_gateway
+
+services:
+
+  mcp_gateway: # 8005
+    container_name: mcp_gateway
+    image: docker/mcp-gateway:dind-v0.42.1
+    privileged: true
+    command:
+    # Configure the MCP Gateway servers and transport
+    - --transport=sse
+    - --port=8005
+    - --servers=tavily,arxiv-mcp-server
+    # Point to the catalog, secrets and config files
+    - --catalog=./app/mcp_catalog.yaml
+    - --config=./app/mcp_config.yaml
+    - --secrets=/app/mcp_secret
+    volumes:
+      # Catalog + config come from the CD checkout of this repo; the secret
+      # stays outside it (root-owned, 0600, created by hand).
+      - /opt/mcp_gateway/repo/mcp_catalog.yaml:/app/mcp_catalog.yaml:ro
+      - /opt/mcp_gateway/secrets/mcp_secret.env:/app/mcp_secret:ro
+      - /opt/mcp_gateway/repo/mcp_config.yaml:/app/mcp_config.yaml:ro
+    # In memory, so every start is clean. A reboot kills this container
+    # mid-flight and Docker *restarts* (not re-creates) it, which kept the inner
+    # dockerd's PID files from the previous run; containerd then refused to
+    # start and the gateway waited for dockerd forever (Dennis, 2026-10-02).
+    # /run, not /var/run: in this image /var/run is a symlink to it.
+    tmpfs:
+      - /run
+    # Healthy = the SSE port is listening (the image has busybox netstat, no
+    # ss). The CD deploy waits on this.
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -ltn | grep -q ':8005 '"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - mcp_gateway
+
+
+networks:
+  # Attachable overlay, created once by hand; magenticx's Swarm stack joins it
+  # too (external), so its agents task reaches this container by name.
+  mcp_gateway:
+    external: true
+    name: mcp_gateway

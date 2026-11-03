@@ -1,0 +1,52 @@
+# Local MCP gateway. Fixed project name, so it doesn't follow the folder.
+# Joins mcp_net, which magenticx's local compose creates: start magenticx
+# first, then `docker compose up -d` here. magenticx's agents reach the
+# gateway by name at http://mcp_gateway:8005/sse.
+name: mcp_gateway
+
+services:
+
+  mcp_gateway: # 8005
+    # The MCP tool gateway (Tavily, arXiv). The dind variant runs its own
+    # Docker daemon so the MCP servers it spawns never touch the host's — that
+    # inner daemon is why it must be privileged. Only agents reaches it, by
+    # name on mcp_net; no host port.
+    container_name: mcp_gateway
+    image: docker/mcp-gateway:dind-v0.42.1
+    privileged: true
+    command:
+    - --transport=sse
+    - --port=8005
+    - --servers=tavily,arxiv-mcp-server
+    - --catalog=./app/mcp_catalog.yaml
+    - --secrets=/app/secrets/mcp_secret.env
+    - --config=./app/mcp_config.yaml
+    volumes:
+      - ./mcp_catalog.yaml:/app/mcp_catalog.yaml:ro
+      - ./mcp_config.yaml:/app/mcp_config.yaml:ro
+      - ./mcp_secret.env:/app/secrets/mcp_secret.env:ro
+    # In memory, so every start is clean. A reboot kills this container
+    # mid-flight and Docker *restarts* (not re-creates) it, which kept the inner
+    # dockerd's PID files from the previous run; containerd then refused to
+    # start and the gateway waited for dockerd forever (Dennis, 2026-10-02).
+    # /run, not /var/run: in this image /var/run is a symlink to it.
+    tmpfs:
+      - /run
+    # Healthy = the SSE port is listening (busybox netstat; the image has no ss).
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -ltn | grep -q ':8005 '"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - mcp_net
+
+
+networks:
+  # Owned by magenticx (agents ↔ mcp_gateway only). Not internal: the gateway
+  # needs the internet to pull MCP server images and reach Tavily/arXiv.
+  mcp_net:
+    external: true
+    name: mcp_net

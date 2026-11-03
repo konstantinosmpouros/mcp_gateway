@@ -1,0 +1,7 @@
+# Live MCP-server credentials — copy mcp_secret.example.env and fill it in.
+mcp_secret.env
+.env
+
+# SSH deploy keys: the private key lives only in the DENNIS_SSH_KEY repo secret.
+gha_*
+*.pem
