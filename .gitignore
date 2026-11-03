@@ -5,3 +5,6 @@ mcp_secret.env
 # SSH deploy keys: the private key lives only in the DENNIS_SSH_KEY repo secret.
 gha_*
 *.pem
+
+# Local agent instructions/runbook — kept out of the public repo.
+CLAUDE.md

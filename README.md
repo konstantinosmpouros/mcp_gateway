@@ -20,4 +20,4 @@ docker compose up -d
 
 Gateway stuck on `Waiting for dockerd...`? `docker compose up -d --force-recreate --no-deps mcp_gateway` — a plain `docker restart` won't fix it.
 
-Deployment on Dennis, adding a server and the security model: see [CLAUDE.md](CLAUDE.md).
+Deployment on Dennis is automated by the CI/CD pipeline ([`.github/workflows/pipeline.yml`](.github/workflows/pipeline.yml)) over a locked-down SSH key; the operational runbook is kept privately.
